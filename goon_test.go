@@ -17,11 +17,14 @@
 package goon
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/context"
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/aetest"
@@ -156,7 +159,8 @@ type ivItemI interface {
 var ivItems []ivItem
 
 func initializeIvItems(c context.Context) {
-	t1 := time.Now().Truncate(time.Microsecond)
+	// We force UTC, because the datastore API will always return UTC
+	t1 := time.Now().UTC().Truncate(time.Microsecond)
 	t2 := t1.Add(time.Second * 1)
 	t3 := t1.Add(time.Second * 2)
 
@@ -764,23 +768,25 @@ func TestInputVariety(t *testing.T) {
 }
 
 type MigrationA struct {
-	_kind     string            `goon:"kind,Migration"`
-	Id        int64             `datastore:"-" goon:"id"`
-	Number    int32             `datastore:"number,noindex"`
-	Word      string            `datastore:"word,noindex"`
-	Car       string            `datastore:"car,noindex"`
-	Holiday   time.Time         `datastore:"holiday,noindex"`
-	α         int               `datastore:",noindex"`
-	Level     MigrationIntA     `datastore:"level,noindex"`
-	Floor     MigrationIntA     `datastore:"floor,noindex"`
-	Sub       MigrationSub      `datastore:"sub,noindex"`
-	Son       MigrationPerson   `datastore:"son,noindex"`
-	Daughter  MigrationPerson   `datastore:"daughter,noindex"`
-	Parents   []MigrationPerson `datastore:"parents,noindex"`
-	DeepSlice MigrationDeepA    `datastore:"deep,noindex"`
-	ZZs       []ZigZag          `datastore:"zigzag,noindex"`
-	ZeroKey   *datastore.Key    `datastore:",noindex"`
-	File      []byte
+	_kind            string            `goon:"kind,Migration"`
+	Id               int64             `datastore:"-" goon:"id"`
+	Number           int32             `datastore:"number"`
+	Word             string            `datastore:"word,noindex"`
+	Car              string            `datastore:"car,noindex"`
+	Holiday          time.Time         `datastore:"holiday,noindex"`
+	α                int               `datastore:",noindex"`
+	Level            MigrationIntA     `datastore:"level,noindex"`
+	Floor            MigrationIntA     `datastore:"floor,noindex"`
+	Sub              MigrationSub      `datastore:"sub,noindex"`
+	Son              MigrationPerson   `datastore:"son,noindex"`
+	Daughter         MigrationPerson   `datastore:"daughter,noindex"`
+	Parents          []MigrationPerson `datastore:"parents,noindex"`
+	DeepSlice        MigrationDeepA    `datastore:"deep,noindex"`
+	ZZs              []ZigZag          `datastore:"zigzag,noindex"`
+	ZeroKey          *datastore.Key    `datastore:",noindex"`
+	File             []byte
+	DeprecatedField  string       `datastore:"depf,noindex"`
+	DeprecatedStruct MigrationSub `datastore:"deps,noindex"`
 }
 
 type MigrationSub struct {
@@ -826,7 +832,7 @@ type MigrationIntB int
 type MigrationB struct {
 	_kind          string            `goon:"kind,Migration"`
 	Identification int64             `datastore:"-" goon:"id"`
-	FancyNumber    int32             `datastore:"number,noindex"`
+	FancyNumber    int32             `datastore:"number"`
 	Slang          string            `datastore:"word,noindex"`
 	Cars           []string          `datastore:"car,noindex"`
 	Holidays       []time.Time       `datastore:"holiday,noindex"`
@@ -846,6 +852,14 @@ type MigrationB struct {
 	Files          [][]byte          `datastore:"File,noindex"`
 }
 
+const (
+	migrationMethodGet = iota
+	migrationMethodGetAll
+	migrationMethodGetAllMulti
+	migrationMethodNext
+	migrationMethodCount
+)
+
 func TestMigration(t *testing.T) {
 	c, done, err := aetest.NewContext()
 	if err != nil {
@@ -856,44 +870,103 @@ func TestMigration(t *testing.T) {
 
 	// Create & save an entity with the original structure
 	migA := &MigrationA{Id: 1, Number: 123, Word: "rabbit", Car: "BMW",
-		Holiday: time.Now().Truncate(time.Microsecond), α: 1, Level: 9001, Floor: 5,
+		Holiday: time.Now().UTC().Truncate(time.Microsecond), α: 1, Level: 9001, Floor: 5,
 		Sub: MigrationSub{Data: "fox", Noise: []int{1, 2, 3}, Sub: MigrationSubSub{Data: "rose"}},
 		Son: MigrationPerson{Name: "John", Age: 5}, Daughter: MigrationPerson{Name: "Nancy", Age: 6},
 		Parents:   []MigrationPerson{{Name: "Sven", Age: 56}, {Name: "Sonya", Age: 49}},
 		DeepSlice: MigrationDeepA{Deep: MigrationDeepB{Deep: MigrationDeepC{Slice: []int{1, 2, 3}}}},
-		ZZs:       []ZigZag{{Zig: 1}, {Zag: 1}}, File: []byte{0xF0, 0x0D}}
+		ZZs:       []ZigZag{{Zig: 1}, {Zag: 1}}, File: []byte{0xF0, 0x0D},
+		DeprecatedField: "dep", DeprecatedStruct: MigrationSub{Data: "dep"}}
 	if _, err := g.Put(migA); err != nil {
 		t.Errorf("Unexpected error on Put: %v", err)
 	}
-
-	// Clear the local cache, because we want this data in memcache
-	g.FlushLocalCache()
-
-	// Get it back, so it's in the cache
-	migA = &MigrationA{Id: 1}
-	if err := g.Get(migA); err != nil {
-		t.Errorf("Unexpected error on Get: %v", err)
+	// Also save an already migrated structure
+	migB := &MigrationB{Identification: migA.Id + 1, FancyNumber: migA.Number + 1}
+	if _, err := g.Put(migB); err != nil {
+		t.Errorf("Unexpected error on Put: %v", err)
 	}
 
-	// Clear the local cache, because it doesn't need to support migration
-	g.FlushLocalCache()
+	// Due to eventual consistency, we need to wait a bit.
+	time.Sleep(1 * time.Second)
 
-	// Test whether memcache supports migration
-	verifyMigration(t, g, migA, "MC")
+	// Run migration tests with both IgnoreFieldMismatch on & off
+	for i := 0; i < 2; i++ {
+		IgnoreFieldMismatch = (i == 0)
 
-	// Clear all the caches
-	g.FlushLocalCache()
-	memcache.Flush(c)
+		// Clear all the caches
+		g.FlushLocalCache()
+		memcache.Flush(c)
 
-	// Test whether datastore supports migration
-	verifyMigration(t, g, migA, "DS")
+		// Get it back, so it's in the cache
+		migA = &MigrationA{Id: 1}
+		if err := g.Get(migA); err != nil {
+			t.Errorf("Unexpected error on Get: %v", err)
+		}
+
+		// Clear the local cache, because it doesn't need to support migration
+		g.FlushLocalCache()
+
+		// Test whether memcache supports migration
+		verifyMigration(t, g, migA, migrationMethodGet, fmt.Sprintf("MC-%v", IgnoreFieldMismatch))
+
+		for method := 0; method < migrationMethodCount; method++ {
+			// Clear all the caches
+			g.FlushLocalCache()
+			memcache.Flush(c)
+
+			// Test whether datastore supports migration
+			verifyMigration(t, g, migA, method, fmt.Sprintf("DS-%v-%v", method, IgnoreFieldMismatch))
+		}
+	}
 }
 
-func verifyMigration(t *testing.T, g *Goon, migA *MigrationA, debugInfo string) {
+func verifyMigration(t *testing.T, g *Goon, migA *MigrationA, method int, debugInfo string) {
 	migB := &MigrationB{Identification: migA.Id}
-	if err := g.Get(migB); err != nil {
-		t.Errorf("%v > Unexpected error on Get: %v", debugInfo, err)
-	} else if migA.Id != migB.Identification {
+
+	switch method {
+	case migrationMethodGet:
+		if err := g.Get(migB); err != nil && (IgnoreFieldMismatch || !errFieldMismatch(err)) {
+			t.Errorf("%v > Unexpected error on Get: %v", debugInfo, err)
+			return
+		}
+		break
+	case migrationMethodGetAll:
+		migBs := []*MigrationB{}
+		if _, err := g.GetAll(datastore.NewQuery("Migration").Filter("number=", migA.Number), &migBs); err != nil && (IgnoreFieldMismatch || !errFieldMismatch(err)) {
+			t.Errorf("%v > Unexpected error on GetAll: %v", debugInfo, err)
+			return
+		} else if len(migBs) != 1 {
+			t.Errorf("%v > Unexpected query result, expected %v entities, got %v", debugInfo, 1, len(migBs))
+			return
+		}
+		migB = migBs[0]
+		break
+	case migrationMethodGetAllMulti:
+		// Get both Migration entities
+		migBs := []*MigrationB{}
+		if _, err := g.GetAll(datastore.NewQuery("Migration").Order("number"), &migBs); err != nil && (IgnoreFieldMismatch || !errFieldMismatch(err)) {
+			t.Errorf("%v > Unexpected error on GetAll: %v", debugInfo, err)
+			return
+		} else if len(migBs) != 2 {
+			t.Errorf("%v > Unexpected query result, expected %v entities, got %v", debugInfo, 2, len(migBs))
+			return
+		}
+		migB = migBs[0]
+		break
+	case migrationMethodNext:
+		it := g.Run(datastore.NewQuery("Migration").Filter("number=", migA.Number))
+		if _, err := it.Next(migB); err != nil && (IgnoreFieldMismatch || !errFieldMismatch(err)) {
+			t.Errorf("%v > Unexpected error on Next: %v", debugInfo, err)
+			return
+		}
+		// Make sure the iterator ends correctly
+		if _, err := it.Next(&MigrationB{}); err != datastore.Done {
+			t.Errorf("Next: expected iterator to end with the error datastore.Done, got %v", err)
+		}
+		break
+	}
+
+	if migA.Id != migB.Identification {
 		t.Errorf("%v > Ids don't match: %v != %v", debugInfo, migA.Id, migB.Identification)
 	} else if migA.Number != migB.FancyNumber {
 		t.Errorf("%v > Numbers don't match: %v != %v", debugInfo, migA.Number, migB.FancyNumber)
@@ -1076,6 +1149,59 @@ func TestNegativeCacheHit(t *testing.T) {
 	// Get the entity again via goon, to make sure we cached the non-existance
 	if err := g.Get(hid); err != datastore.ErrNoSuchEntity {
 		t.Errorf("Expected ErrNoSuchEntity, got %v", err)
+	}
+}
+
+func TestNegativeCacheClear(t *testing.T) {
+	c, done, err := aetest.NewContext()
+	if err != nil {
+		t.Fatalf("Could not start aetest - %v", err)
+	}
+	defer done()
+	g := FromContext(c)
+
+	hid := &HasId{Name: "one"}
+	var id int64
+
+	puted := make(chan bool)
+	cached := make(chan bool)
+	ended := make(chan bool)
+
+	go func() {
+		err := g.RunInTransaction(func(tg *Goon) error {
+			tg.Put(hid)
+			id = hid.Id
+			puted <- true
+			<-cached
+			return nil
+		}, nil)
+		if err != nil {
+			t.Errorf("Unexpected error on RunInTransaction: %v", err)
+		}
+		ended <- true
+	}()
+
+	// simulate negative cache (yet commit)
+	{
+		<-puted
+		negative := &HasId{Id: id}
+		g.FlushLocalCache()
+		if err := g.Get(negative); err != datastore.ErrNoSuchEntity {
+			t.Errorf("Expected ErrNoSuchEntity, got %v", err)
+		}
+		cached <- true
+	}
+
+	{
+		<-ended
+		want := &HasId{Id: id}
+		g.FlushLocalCache()
+		if err := g.Get(want); err != nil {
+			t.Errorf("Unexpected error on get: %v", err)
+		}
+		if want.Name != hid.Name {
+			t.Errorf("Expected Get Entity got : %v", want)
+		}
 	}
 }
 
@@ -1289,11 +1415,11 @@ func TestGoon(t *testing.T) {
 		t.Errorf("get: unexpected error - %v", err)
 	}
 	if hi2.Name != hi.Name {
-		t.Errorf("Could not fetch HasId object from memory - %#v != %#v, memory=%#v", hi, hi2, n.cache[memkey(n.Key(hi2))])
+		t.Errorf("Could not fetch HasId object from memory - %#v != %#v, memory=%#v", hi, hi2, n.cache[MemcacheKey(n.Key(hi2))])
 	}
 
 	hi3 := &HasId{Id: hi.Id}
-	delete(n.cache, memkey(n.Key(hi)))
+	delete(n.cache, MemcacheKey(n.Key(hi)))
 	if err := n.Get(hi3); err != nil {
 		t.Errorf("get: unexpected error - %v", err)
 	}
@@ -1302,7 +1428,7 @@ func TestGoon(t *testing.T) {
 	}
 
 	hi4 := &HasId{Id: hi.Id}
-	delete(n.cache, memkey(n.Key(hi4)))
+	delete(n.cache, MemcacheKey(n.Key(hi4)))
 	if memcache.Flush(n.Context) != nil {
 		t.Errorf("Unable to flush memcache")
 	}
@@ -1320,7 +1446,7 @@ func TestGoon(t *testing.T) {
 	// hi in datastore Name = hasid
 	hiPull := &HasId{Id: hi.Id}
 	n.cacheLock.Lock()
-	n.cache[memkey(n.Key(hi))].(*HasId).Name = "changedincache"
+	n.cache[MemcacheKey(n.Key(hi))].(*HasId).Name = "changedincache"
 	n.cacheLock.Unlock()
 	if err := n.Get(hiPull); err != nil {
 		t.Errorf("get: unexpected error - %v", err)
@@ -1332,7 +1458,7 @@ func TestGoon(t *testing.T) {
 	hiPush := &HasId{Id: hi.Id, Name: "changedinmemcache"}
 	n.putMemcache([]interface{}{hiPush}, []byte{1})
 	n.cacheLock.Lock()
-	delete(n.cache, memkey(n.Key(hi)))
+	delete(n.cache, MemcacheKey(n.Key(hi)))
 	n.cacheLock.Unlock()
 
 	hiPull = &HasId{Id: hi.Id}
@@ -1862,6 +1988,47 @@ func TestRace(t *testing.T) {
 			t.Errorf("Object #%d not fetched properly, fetched instead - %v", x, hi)
 		}
 	}
+
+	// in case of datastore failure
+	errInternalCall := errors.New("internal call error")
+	withErrorContext := func(ctx context.Context, multiLimit int) context.Context {
+		return appengine.WithAPICallFunc(ctx, func(ctx context.Context, service, method string, in, out proto.Message) error {
+			if service != "datastore_v3" {
+				return nil
+			}
+			if method != "Put" && method != "Get" && method != "Delete" {
+				return nil
+			}
+			errs := make(appengine.MultiError, multiLimit)
+			for x := 0; x < multiLimit; x++ {
+				errs[x] = errInternalCall
+			}
+			return errs
+		})
+	}
+
+	g.Context = withErrorContext(g.Context, putMultiLimit)
+	_, err = g.PutMulti(hasIdSlice)
+	if err != errInternalCall {
+		t.Fatalf("Expected %v, got %v", errInternalCall, err)
+	}
+
+	g.FlushLocalCache()
+	g.Context = withErrorContext(g.Context, getMultiLimit)
+	err = g.GetMulti(hasIdSlice)
+	if err != errInternalCall {
+		t.Fatalf("Expected %v, got %v", errInternalCall, err)
+	}
+
+	keys := make([]*datastore.Key, len(hasIdSlice))
+	for x, hasId := range hasIdSlice {
+		keys[x] = g.Key(hasId)
+	}
+	g.Context = withErrorContext(g.Context, deleteMultiLimit)
+	err = g.DeleteMulti(keys)
+	if err != errInternalCall {
+		t.Fatalf("Expected %v, got %v", errInternalCall, err)
+	}
 }
 
 func TestPutGet(t *testing.T) {
@@ -1968,13 +2135,42 @@ func TestMultis(t *testing.T) {
 		for y := 0; y < x; y++ {
 			objects[y] = &HasId{Id: int64(y + 1)}
 		}
-		if _, err := n.PutMulti(objects); err != nil {
+		if keys, err := n.PutMulti(objects); err != nil {
 			t.Fatalf("Error in PutMulti for %d objects - %v", x, err)
+		} else if len(keys) != len(objects) {
+			t.Fatalf("Expected %v keys, got %v", len(objects), len(keys))
+		} else {
+			for i, key := range keys {
+				if key.IntID() != int64(i+1) {
+					t.Fatalf("Expected object #%v key to be %v, got %v", i, (i + 1), key.IntID())
+				}
+			}
 		}
 		n.FlushLocalCache() // Put just put them in the local cache, get rid of it before doing the Get
 		if err := n.GetMulti(objects); err != nil {
 			t.Fatalf("Error in GetMulti - %v", err)
 		}
+	}
+
+	// check if the returned keys match the struct keys for autogenerated keys
+	for _, x := range testAmounts {
+		memcache.Flush(c)
+		objects := make([]*HasId, x)
+		for y := 0; y < x; y++ {
+			objects[y] = &HasId{}
+		}
+		if keys, err := n.PutMulti(objects); err != nil {
+			t.Fatalf("Error in PutMulti for %d objects - %v", x, err)
+		} else if len(keys) != len(objects) {
+			t.Fatalf("Expected %v keys, got %v", len(objects), len(keys))
+		} else {
+			for i, key := range keys {
+				if key.IntID() != objects[i].Id {
+					t.Errorf("Expected object #%v key to be %v, got %v", i, objects[i].Id, key.IntID())
+				}
+			}
+		}
+		n.FlushLocalCache()
 	}
 
 	// do it again, but only write numbers divisible by 100
@@ -2093,12 +2289,18 @@ func TestParents(t *testing.T) {
 
 type ContainerStruct struct {
 	Id string `datastore:"-" goon:"id"`
-	embeddedStruct
+	embeddedStructA
+	embeddedStructB `datastore:"w"`
 }
 
-type embeddedStruct struct {
+type embeddedStructA struct {
 	X int
 	y int
+}
+
+type embeddedStructB struct {
+	Z1 int
+	Z2 int `datastore:"z2fancy"`
 }
 
 func TestEmbeddedStruct(t *testing.T) {
@@ -2111,8 +2313,7 @@ func TestEmbeddedStruct(t *testing.T) {
 
 	// Store some data with an embedded unexported struct
 	pcs := &ContainerStruct{Id: "foo"}
-	pcs.X = 1
-	pcs.y = 2
+	pcs.X, pcs.y, pcs.Z1, pcs.Z2 = 1, 2, 3, 4
 	_, err = g.Put(pcs)
 	if err != nil {
 		t.Errorf("Unexpected error on put - %v", err)
@@ -2134,9 +2335,49 @@ func TestEmbeddedStruct(t *testing.T) {
 		if gcs.X != pcs.X {
 			t.Errorf("#%v - Expected - %v, got %v", i, pcs.X, gcs.X)
 		}
+		if gcs.Z1 != pcs.Z1 {
+			t.Errorf("#%v - Expected - %v, got %v", i, pcs.Z1, gcs.Z1)
+		}
+		if gcs.Z2 != pcs.Z2 {
+			t.Errorf("#%v - Expected - %v, got %v", i, pcs.Z2, gcs.Z2)
+		}
 		// The unexported field must be zero-valued
 		if gcs.y != 0 {
 			t.Errorf("#%v - Expected - %v, got %v", i, 0, gcs.y)
 		}
+	}
+}
+
+func TestChangeMemcacheKey(t *testing.T) {
+	c, done, err := aetest.NewContext()
+	if err != nil {
+		t.Fatalf("Could not start aetest - %v", err)
+	}
+	defer done()
+
+	originalMemcacheKey := MemcacheKey
+	defer func() {
+		MemcacheKey = originalMemcacheKey
+	}()
+	verID := appengine.VersionID(c)
+	MemcacheKey = func(k *datastore.Key) string {
+		return "g2:" + verID + ":" + k.Encode()
+	}
+
+	g := FromContext(c)
+
+	key, err := g.Put(&PutGet{ID: 12, Value: 15})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.FlushLocalCache()
+	err = g.Get(&PutGet{ID: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = memcache.Get(c, "g2:"+verID+":"+key.Encode())
+	if err != nil {
+		t.Fatal("Memcache key should have 'g2:`versionID`:prefix", err)
 	}
 }
