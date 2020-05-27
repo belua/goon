@@ -134,5 +134,13 @@ requests. The default settings were determined experimentally and should
 provide reasonable defaults for most applications.
 
 See: http://talks.golang.org/2013/highperf.slide#23
+
+PropertyLoadSaver support
+
+Structs that implement the PropertyLoadSaver interface are guaranteed to call
+the Save() method once and only once per Put/PutMulti call and never elsewhere.
+Similarly the Load() method is guaranteed to be called once and only once per
+Get/GetMulti/GetAll/Next call and never elsewhere.
+
 */
 package goon

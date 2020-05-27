@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012 Matt Jibson <matt.jibson@gmail.com>
+ * Copyright (c) 2012 The Goon Authors
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,7 +17,8 @@
 package goon
 
 import (
-	"bytes"
+	"context"
+	"encoding/ascii85"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -26,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"golang.org/x/crypto/blake2b"
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/datastore"
 	"google.golang.org/appengine/log"
@@ -39,44 +40,132 @@ var (
 	// LogTimeoutErrors issues appengine.Context.Warningf on memcache timeout errors.
 	LogTimeoutErrors = false
 
-	// MemcachePutTimeoutThreshold is the number of bytes at which the memcache
-	// timeout uses the large setting.
-	MemcachePutTimeoutThreshold = 1024 * 50
-	// MemcachePutTimeoutSmall is the amount of time to wait during memcache
+	// MemcachePutTimeoutThreshold is the number of bytes after which the large
+	// timeout setting is added to the small timeout setting. This repeats.
+	// Which means that with a 20 KiB threshold and a 100 KiB memcache payload,
+	// the final timeout is MemcachePutTimeoutSmall + 5*MemcachePutTimeoutLarge
+	MemcachePutTimeoutThreshold = 20 * 1024 // 20 KiB
+	// MemcachePutTimeoutSmall is the minimum time to wait during memcache
 	// Put operations before aborting them and using the datastore.
-	MemcachePutTimeoutSmall = time.Millisecond * 5
-	// MemcachePutTimeoutLarge is the amount of time to wait for large memcache
-	// Put requests.
-	MemcachePutTimeoutLarge = time.Millisecond * 15
+	MemcachePutTimeoutSmall = 5 * time.Millisecond
+	// MemcachePutTimeoutLarge is the amount of extra time to wait for larger
+	// memcache Put requests. See also MemcachePutTimeoutThreshold.
+	MemcachePutTimeoutLarge = 1 * time.Millisecond
 	// MemcacheGetTimeout is the amount of time to wait for all memcache Get
-	// requests.
-	MemcacheGetTimeout = time.Millisecond * 10
+	// requests, per key fetched. Because we can't really know how big entities
+	// we are requesting, this setting should be for the maximum size entity.
+	// The final timeout is limited to the number of maximum sized entities
+	// an RPC result can contain, so the timeout won't grow insanely large
+	// if you're fetching a ton of small entities.
+	MemcacheGetTimeout = 31250 * time.Microsecond // 31.25 milliseconds
 
 	// IgnoreFieldMismatch decides whether *datastore.ErrFieldMismatch errors
 	// should be silently ignored. This allows you to easily remove fields from structs.
 	IgnoreFieldMismatch = true
 )
 
+var (
+	// Determines if memcache.PutMulti errors are returned by goon.
+	// Currently only meant for use during goon development testing.
+	propagateMemcachePutError = false
+)
+
 // Goon holds the app engine context and the request memory cache.
 type Goon struct {
 	Context       context.Context
-	cache         map[string]interface{}
-	cacheLock     sync.RWMutex // protect the cache from concurrent goroutines to speed up RPC access
+	cache         *cache
 	inTransaction bool
-	txnCacheLock  sync.Mutex // protects toSet / toDelete / toDeleteMC
-	toSet         map[string]interface{}
-	toDelete      map[string]bool
-	toDeleteMC    map[string]bool
+	txnCacheLock  sync.Mutex // protects toDelete / toDeleteMC
+	toDelete      map[string]struct{}
+	toDeleteMC    map[string]struct{}
 	// KindNameResolver is used to determine what Kind to give an Entity.
 	// Defaults to DefaultKindName
 	KindNameResolver KindNameResolver
 }
 
-// MemcacheKey returns key string of Memcache.
+// MemcacheKey returns the string form of the provided datastore key.
 var MemcacheKey = func(k *datastore.Key) string {
-	// Versioning, so that incompatible changes to the cache system won't cause problems
-	return "g3:" + k.Encode()
+	return k.Encode()
 }
+
+// Versioning, so that incompatible changes to the cache system won't cause problems
+var cacheKeyPrefix = fmt.Sprintf("g%X:", serializationFormatVersion)
+
+// cacheKey returns the fully legal string key used for cache systems
+func cacheKey(k *datastore.Key) string {
+	// By default we just use the prefix + MemcacheKey result
+	key := cacheKeyPrefix + MemcacheKey(k)
+	// However if the resulting key length exceeds the maximum allowed ..
+	if len(key) > memcacheMaxKeySize {
+		// .. then we need to shorten it while still staying unique.
+		// We pass the key through the BLAKE2b hash function,
+		// which is cryptographically secure but also very fast.
+		// We request an output of 24 bytes (192-bit) for speed reasons.
+		h, err := blake2b.New(24, nil)
+		if err != nil {
+			panic(fmt.Sprintf("Unexpected error initializing blake2b: %v", err))
+		}
+		h.Write([]byte(key))
+		hash := h.Sum(make([]byte, 0, 24))
+		// After hashing, we encode the results with ascii85.
+		// Ascii85 works in 4 byte chunks, generating 5 letters for each.
+		// Which means we turn our 24 byte hash into a 30 letter string.
+		//
+		// We want letters instead of using the hash directly for debug reasons.
+		// As it will be easier for people to observe & manage keys manually.
+		//
+		// We aim the length of 30, because 32 is the maximum length
+		// where the Go std map does key lookups directly without hashing.
+		encoded := make([]byte, 30, 30)
+		ascii85.Encode(encoded, hash)
+		key = string(encoded)
+	}
+	return key
+}
+
+// Returns the duration that should be used for a memcache.GetMulti timeout.
+func memcacheGetTimeout(keyCount int) time.Duration {
+	// Takes the number of keys given to memcache.GetMulti,
+	// clamps that to the maximum number of max sized items,
+	// and multiplies it with the per-max-sized-item timeout.
+	if keyCount > memcacheMaxRPCSize/memcacheMaxItemSize {
+		keyCount = memcacheMaxRPCSize / memcacheMaxItemSize
+	}
+	return time.Duration(keyCount) * MemcacheGetTimeout
+}
+
+// Returns the duration that should be used for a memcache.PutMulti timeout.
+func memcachePutTimeout(payloadSize int) time.Duration {
+	// Takes the payload size given to memcache.PutMulti,
+	// and returns a dynamic duration based on that size.
+	return MemcachePutTimeoutSmall + time.Duration(payloadSize/MemcachePutTimeoutThreshold)*MemcachePutTimeoutLarge
+}
+
+// Memcache limits
+// These are based on the constants in SDK/google/appengine/api/memcache/memcache_stub.py
+// Also documented in https://cloud.google.com/appengine/docs/standard/go/memcache/
+const (
+	// The Google provided overhead is 73 bytes, which seems wrong in practice.
+	// Testing has shown that Put/PutMulti will succeed with even a lower overhead.
+	// However by 'succeed' I mean not erroring. The value never gets stored.
+	// The actual overhead seems to be 76 at which point the items will
+	// start being stored in memcache and show up in the statistics.
+	memcacheOverhead     = 76
+	memcacheMaxKeySize   = 250
+	memcacheMaxItemSize  = 1 << 20 // 1 MiB
+	memcacheMaxValueSize = memcacheMaxItemSize - memcacheMaxKeySize - memcacheOverhead
+	memcacheMaxRPCSize   = 32 << 20 // 32 MiB
+)
+
+// Datastore limits
+const (
+	datastoreGetMultiMaxItems    = 1000
+	datastorePutMultiMaxItems    = 500
+	datastoreDeleteMultiMaxItems = 500
+
+	// The maximum GetMulti result RPC size was determined experimentally on 2019-05-20
+	datastoreGetMultiMaxRPCSize = 50 << 20 // 50 MiB
+)
 
 // NewGoon creates a new Goon object from the given request.
 func NewGoon(r *http.Request) *Goon {
@@ -88,7 +177,7 @@ func NewGoon(r *http.Request) *Goon {
 func FromContext(c context.Context) *Goon {
 	return &Goon{
 		Context:          c,
-		cache:            make(map[string]interface{}),
+		cache:            newCache(defaultCacheLimit),
 		KindNameResolver: DefaultKindName,
 	}
 }
@@ -108,6 +197,28 @@ func (g *Goon) error(err error) {
 func (g *Goon) timeoutError(err error) {
 	if LogTimeoutErrors {
 		log.Warningf(g.Context, "goon memcache timeout: %v", err)
+	}
+}
+
+func (g *Goon) memcacheDeleteError(err error) {
+	if err == nil || !LogErrors {
+		return
+	}
+	if me, ok := err.(appengine.MultiError); ok {
+		for i := range me {
+			if me[i] != nil && me[i] != memcache.ErrCacheMiss {
+				err = me[i]
+				goto reportError
+			}
+		}
+		return
+	}
+reportError:
+	_, filename, line, ok := runtime.Caller(1)
+	if ok {
+		log.Errorf(g.Context, "goon - %s:%d - memcache.DeleteMulti failed: %v - the goon cache may be out of sync now!", filepath.Base(filename), line, err)
+	} else {
+		log.Errorf(g.Context, "goon - memcache.DeleteMulti failed: %v - the goon cache may be out of sync now!", err)
 	}
 }
 
@@ -170,9 +281,8 @@ func (g *Goon) RunInTransaction(f func(tg *Goon) error, opts *datastore.Transact
 		ng = &Goon{
 			Context:          tc,
 			inTransaction:    true,
-			toSet:            make(map[string]interface{}),
-			toDelete:         make(map[string]bool),
-			toDeleteMC:       make(map[string]bool),
+			toDelete:         make(map[string]struct{}),
+			toDeleteMC:       make(map[string]struct{}),
 			KindNameResolver: g.KindNameResolver,
 		}
 		return f(ng)
@@ -186,15 +296,10 @@ func (g *Goon) RunInTransaction(f func(tg *Goon) error, opts *datastore.Transact
 			for k := range ng.toDeleteMC {
 				memkeys = append(memkeys, k)
 			}
-			memcache.DeleteMulti(g.Context, memkeys)
-		}
-		g.cacheLock.Lock()
-		defer g.cacheLock.Unlock()
-		for k, v := range ng.toSet {
-			g.cache[k] = v
+			g.memcacheDeleteError(memcache.DeleteMulti(g.Context, memkeys))
 		}
 		for k := range ng.toDelete {
-			delete(g.cache, k)
+			g.cache.Delete(k)
 		}
 	} else {
 		g.error(err)
@@ -207,6 +312,10 @@ func (g *Goon) RunInTransaction(f func(tg *Goon) error, opts *datastore.Transact
 // is an incomplete key, the returned key will be a unique key generated by
 // the datastore.
 func (g *Goon) Put(src interface{}) (*datastore.Key, error) {
+	v := reflect.ValueOf(src)
+	if v.Kind() != reflect.Ptr {
+		return nil, fmt.Errorf("goon: expected pointer to a struct, got %#v", src)
+	}
 	ks, err := g.PutMulti([]interface{}{src})
 	if err != nil {
 		if me, ok := err.(appengine.MultiError); ok {
@@ -216,8 +325,6 @@ func (g *Goon) Put(src interface{}) (*datastore.Key, error) {
 	}
 	return ks[0], nil
 }
-
-const putMultiLimit = 500
 
 // PutMulti is a batch version of Put.
 //
@@ -232,14 +339,14 @@ func (g *Goon) PutMulti(src interface{}) ([]*datastore.Key, error) {
 	v := reflect.Indirect(reflect.ValueOf(src))
 	mu := new(sync.Mutex)
 	multiErr, any := make(appengine.MultiError, len(keys)), false
-	goroutines := (len(keys)-1)/putMultiLimit + 1
+	goroutines := (len(keys)-1)/datastorePutMultiMaxItems + 1
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func(i int) {
 			defer wg.Done()
-			lo := i * putMultiLimit
-			hi := (i + 1) * putMultiLimit
+			lo := i * datastorePutMultiMaxItems
+			hi := (i + 1) * datastorePutMultiMaxItems
 			if hi > len(keys) {
 				hi = len(keys)
 			}
@@ -268,32 +375,30 @@ func (g *Goon) PutMulti(src interface{}) ([]*datastore.Key, error) {
 					g.setStructKey(vi, rkeys[i])
 					keys[lo+i] = rkeys[i]
 				}
-				if g.inTransaction {
-					mk := MemcacheKey(rkeys[i])
-					g.txnCacheLock.Lock()
-					delete(g.toDelete, mk)
-					g.toSet[mk] = vi
-					g.toDeleteMC[mk] = true
-					g.txnCacheLock.Unlock()
-				} else {
-					g.putMemory(vi)
-				}
 			}
 		}(i)
 	}
 	wg.Wait()
 
-	// Memcache needs to be updated after the datastore to prevent a common race condition,
+	// Caches need to be updated after the datastore to prevent a common race condition,
 	// where a concurrent request will fetch the not-yet-updated data from the datastore
-	// and populate memcache with it.
-	if !g.inTransaction {
-		var memkeys []string
-		for _, key := range keys {
-			if !key.Incomplete() {
-				memkeys = append(memkeys, MemcacheKey(key))
-			}
+	// and populate the caches with it.
+	cachekeys := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if !key.Incomplete() {
+			cachekeys = append(cachekeys, cacheKey(key))
 		}
-		memcache.DeleteMulti(g.Context, memkeys)
+	}
+	if g.inTransaction {
+		g.txnCacheLock.Lock()
+		for _, ck := range cachekeys {
+			g.toDelete[ck] = struct{}{}
+			g.toDeleteMC[ck] = struct{}{}
+		}
+		g.txnCacheLock.Unlock()
+	} else {
+		g.cache.DeleteMulti(cachekeys)
+		g.memcacheDeleteError(memcache.DeleteMulti(g.Context, cachekeys))
 	}
 
 	if any {
@@ -302,85 +407,75 @@ func (g *Goon) PutMulti(src interface{}) ([]*datastore.Key, error) {
 	return keys, nil
 }
 
-func (g *Goon) putMemoryMulti(src interface{}, exists []byte) {
-	v := reflect.Indirect(reflect.ValueOf(src))
-	for i := 0; i < v.Len(); i++ {
-		if exists[i] == 0 {
-			continue
-		}
-		g.putMemory(v.Index(i).Interface())
-	}
-}
-
-func (g *Goon) putMemory(src interface{}) {
-	key, _, _ := g.getStructKey(src)
-	g.cacheLock.Lock()
-	defer g.cacheLock.Unlock()
-	g.cache[MemcacheKey(key)] = src
-}
-
 // FlushLocalCache clears the local memory cache.
 func (g *Goon) FlushLocalCache() {
-	g.cacheLock.Lock()
-	g.cache = make(map[string]interface{})
-	g.cacheLock.Unlock()
+	g.cache.Flush()
 }
 
-func (g *Goon) putMemcache(srcs []interface{}, exists []byte) error {
-	items := make([]*memcache.Item, len(srcs))
+type memcacheTask struct {
+	items []*memcache.Item
+	size  int
+}
+
+// NB! putMemcache is expected to treat cacheItem as immutable!
+func (g *Goon) putMemcache(citems []*cacheItem) error {
+	// Go over all the cache items and generate memcache tasks from them,
+	// by splitting them up based on payload size
+	items := make([]*memcache.Item, len(citems))
+	tasks := make([]memcacheTask, 0, 1) // In most cases there's just a single task
+	lastSplit := 0
 	payloadSize := 0
-	for i, src := range srcs {
-		toSerialize := src
-		if exists[i] == 0 {
-			toSerialize = nil
-		}
-		data, err := serializeStruct(toSerialize)
-		if err != nil {
-			g.error(err)
-			return err
-		}
-		key, _, err := g.getStructKey(src)
-		if err != nil {
-			return err
-		}
-		// payloadSize will overflow if we push 2+ gigs on a 32bit machine
-		payloadSize += len(data)
+	for i, citem := range citems {
 		items[i] = &memcache.Item{
-			Key:   MemcacheKey(key),
-			Value: data,
+			Key:   citem.key,
+			Value: citem.value,
+		}
+		itemSize := memcacheOverhead + len(citem.key) + len(citem.value)
+		if payloadSize+itemSize > memcacheMaxRPCSize {
+			tasks = append(tasks, memcacheTask{items: items[lastSplit:i], size: payloadSize})
+			lastSplit = i
+			payloadSize = 0
+		}
+		payloadSize += itemSize
+	}
+	tasks = append(tasks, memcacheTask{items: items[lastSplit:len(citems)], size: payloadSize})
+	// Execute all the tasks with goroutines
+	count := len(tasks)
+	errc := make(chan error, count)
+	for i := 0; i < count; i++ {
+		go func(idx int) {
+			tc, cf := context.WithTimeout(g.Context, memcachePutTimeout(tasks[idx].size))
+			errc <- memcache.SetMulti(tc, tasks[idx].items)
+			cf()
+		}(i)
+	}
+	// Wait for all goroutines to finish and log any errors.
+	// Also return a non-deterministic error if there are any.
+	var rerr error
+	for i := 0; i < count; i++ {
+		err := <-errc
+		if err != nil {
+			if appengine.IsTimeoutError(err) {
+				g.timeoutError(err)
+			} else {
+				g.error(err)
+			}
+			rerr = err
 		}
 	}
-	memcacheTimeout := MemcachePutTimeoutSmall
-	if payloadSize >= MemcachePutTimeoutThreshold {
-		memcacheTimeout = MemcachePutTimeoutLarge
-	}
-	errc := make(chan error)
-	go func() {
-		tc, cf := context.WithTimeout(g.Context, memcacheTimeout)
-		errc <- memcache.SetMulti(tc, items)
-		cf()
-	}()
-	g.putMemoryMulti(srcs, exists)
-	err := <-errc
-	if appengine.IsTimeoutError(err) {
-		g.timeoutError(err)
-		err = nil
-	} else if err != nil {
-		g.error(err)
-	}
-	return err
+	return rerr
 }
 
 // Get loads the entity based on dst's key into dst
 // If there is no such entity for the key, Get returns
 // datastore.ErrNoSuchEntity.
 func (g *Goon) Get(dst interface{}) error {
-	set := reflect.ValueOf(dst)
-	if set.Kind() != reflect.Ptr {
+	v := reflect.ValueOf(dst)
+	if v.Kind() != reflect.Ptr {
 		return fmt.Errorf("goon: expected pointer to a struct, got %#v", dst)
 	}
-	if !set.CanSet() {
-		set = set.Elem()
+	if !v.CanSet() {
+		v = v.Elem()
 	}
 	dsts := []interface{}{dst}
 	if err := g.GetMulti(dsts); err != nil {
@@ -391,11 +486,9 @@ func (g *Goon) Get(dst interface{}) error {
 		// Not multi, normal error
 		return err
 	}
-	set.Set(reflect.Indirect(reflect.ValueOf(dsts[0])))
+	v.Set(reflect.Indirect(reflect.ValueOf(dsts[0])))
 	return nil
 }
-
-const getMultiLimit = 1000
 
 // GetMulti is a batch version of Get.
 //
@@ -410,6 +503,7 @@ func (g *Goon) GetMulti(dst interface{}) error {
 	v := reflect.Indirect(reflect.ValueOf(dst))
 
 	multiErr, anyErr := make(appengine.MultiError, len(keys)), false
+	var extraErr error
 
 	if g.inTransaction {
 		// todo: support getMultiLimit in transactions
@@ -437,49 +531,91 @@ func (g *Goon) GetMulti(dst interface{}) error {
 
 	var dskeys []*datastore.Key
 	var dsdst []interface{}
-	var dixs []int
+	var dixs []int // dskeys[5] === keys[dixs[5]]
 
-	var memkeys []string
-	var mixs []int
+	var mckeys []string
+	var mixs []int // mckeys[3] =~= keys[mixs[3]]
 
-	g.cacheLock.RLock()
+	lckeys := make([]string, 0, len(keys))
+	for _, key := range keys {
+		// NB! Current implementation has optimizations in place
+		// that expect memcache & local cache keys to match.
+		lckeys = append(lckeys, cacheKey(key))
+	}
+
+	lcvalues := g.cache.GetMulti(lckeys)
+
 	for i, key := range keys {
-		m := MemcacheKey(key)
 		vi := v.Index(i)
-
 		if vi.Kind() == reflect.Struct {
 			vi = vi.Addr()
 		}
+		d := vi.Interface()
 
-		if s, present := g.cache[m]; present {
-			if vi.Kind() == reflect.Interface {
-				vi = vi.Elem()
+		if data := lcvalues[i]; data != nil {
+			// Attempt to deserialize the cached value into the struct
+			err := deserializeStruct(d, data)
+			if err != nil && (!IgnoreFieldMismatch || !errFieldMismatch(err)) {
+				if err == datastore.ErrNoSuchEntity || errFieldMismatch(err) {
+					anyErr = true // this flag tells GetMulti to return multiErr later
+					multiErr[i] = err
+				} else {
+					g.error(err)
+					return err
+				}
 			}
-			reflect.Indirect(vi).Set(reflect.Indirect(reflect.ValueOf(s)))
 		} else {
-			memkeys = append(memkeys, m)
+			mckeys = append(mckeys, lckeys[i])
 			mixs = append(mixs, i)
 			dskeys = append(dskeys, key)
-			dsdst = append(dsdst, vi.Interface())
+			dsdst = append(dsdst, d)
 			dixs = append(dixs, i)
 		}
 	}
-	g.cacheLock.RUnlock()
 
-	if len(memkeys) == 0 {
+	if len(mckeys) == 0 {
+		if anyErr {
+			return realError(multiErr)
+		}
 		return nil
 	}
 
-	tc, cf := context.WithTimeout(g.Context, MemcacheGetTimeout)
-	memvalues, err := memcache.GetMulti(tc, memkeys)
-	cf()
-	if appengine.IsTimeoutError(err) {
-		g.timeoutError(err)
-		err = nil
-	} else if err != nil {
-		g.error(err) // timing out or another error from memcache isn't something to fail over, but do log it
-		// No memvalues found, prepare the datastore fetch list already prepared above
-	} else if len(memvalues) > 0 {
+	// memcache.GetMulti is limited to memcacheMaxRPCSize for the data returned.
+	// Thus if the returned data is bigger than memcacheMaxRPCSize - memcacheMaxItemSize
+	// then we do another memcache.GetMulti on the missing keys.
+	memvalues := make(map[string]*memcache.Item, len(mckeys))
+	mcKeysSet := make(map[string]struct{}, len(mckeys))
+	for _, mk := range mckeys {
+		mcKeysSet[mk] = struct{}{}
+	}
+	for {
+		nextmckeys := make([]string, 0, len(mcKeysSet))
+		for mk := range mcKeysSet {
+			nextmckeys = append(nextmckeys, mk)
+		}
+		tc, cf := context.WithTimeout(g.Context, memcacheGetTimeout(len(nextmckeys)))
+		mvs, err := memcache.GetMulti(tc, nextmckeys)
+		cf()
+		// timing out or another error from memcache isn't something to fail over, but do log it
+		if appengine.IsTimeoutError(err) {
+			g.timeoutError(err)
+			break
+		} else if err != nil {
+			g.error(err)
+			break
+		}
+		payloadSize := 0
+		for k, v := range mvs {
+			memvalues[k] = v
+			payloadSize += memcacheOverhead + len(v.Key) + len(v.Value)
+			delete(mcKeysSet, k)
+		}
+		if len(mcKeysSet) == 0 || payloadSize < memcacheMaxRPCSize-memcacheMaxItemSize {
+			break
+		}
+	}
+
+	if len(memvalues) > 0 {
 		// since memcache fetch was successful, reset the datastore fetch list and repopulate it
 		dskeys = dskeys[:0]
 		dsdst = dsdst[:0]
@@ -487,29 +623,26 @@ func (g *Goon) GetMulti(dst interface{}) error {
 		// we only want to check the returned map if there weren't any errors
 		// unlike the datastore, memcache will return a smaller map with no error if some of the keys were missed
 
-		for i, m := range memkeys {
+		for i, m := range mckeys {
 			d := v.Index(mixs[i]).Interface()
 			if v.Index(mixs[i]).Kind() == reflect.Struct {
 				d = v.Index(mixs[i]).Addr().Interface()
 			}
-			fetched := false
 			if s, present := memvalues[m]; present {
+				// Mirror any memcache entries in local cache
+				g.cache.Set(&cacheItem{key: m, value: s.Value})
+				// Attempt to deserialize the cached value into the struct
 				err := deserializeStruct(d, s.Value)
-				if err == nil || (IgnoreFieldMismatch && errFieldMismatch(err)) {
-					g.putMemory(d)
-					fetched = true
-				} else if err == datastore.ErrNoSuchEntity || errFieldMismatch(err) {
-					anyErr = true // this flag tells GetMulti to return multiErr later
-					multiErr[mixs[i]] = err
-					fetched = true // success to fetch negative cache. no need to fallback to datastore
-				} else if err == errCacheFetchFailed {
-					// NOP
-				} else {
-					g.error(err)
-					return err
+				if err != nil && (!IgnoreFieldMismatch || !errFieldMismatch(err)) {
+					if err == datastore.ErrNoSuchEntity || errFieldMismatch(err) {
+						anyErr = true // this flag tells GetMulti to return multiErr later
+						multiErr[mixs[i]] = err
+					} else {
+						g.error(err)
+						return err
+					}
 				}
-			}
-			if !fetched {
+			} else {
 				dskeys = append(dskeys, keys[mixs[i]])
 				dsdst = append(dsdst, d)
 				dixs = append(dixs, mixs[i])
@@ -524,20 +657,38 @@ func (g *Goon) GetMulti(dst interface{}) error {
 	}
 
 	mu := new(sync.Mutex)
-	goroutines := (len(dskeys)-1)/getMultiLimit + 1
+	goroutines := (len(dskeys)-1)/datastoreGetMultiMaxItems + 1
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func(i int) {
 			defer wg.Done()
-			var toCache []interface{}
-			var exists []byte
-			lo := i * getMultiLimit
-			hi := (i + 1) * getMultiLimit
+			lo := i * datastoreGetMultiMaxItems
+			hi := (i + 1) * datastoreGetMultiMaxItems
 			if hi > len(dskeys) {
 				hi = len(dskeys)
 			}
-			gmerr := datastore.GetMulti(g.Context, dskeys[lo:hi], dsdst[lo:hi])
+			toCache := make([]*cacheItem, 0, hi-lo)
+			propLists := make([]datastore.PropertyList, hi-lo)
+			handleProp := func(i, idx int, exists bool) {
+				// Serialize the properties
+				data, err := serializeProperties(propLists[i], exists)
+				if err != nil {
+					g.error(err)
+					multiErr[idx] = err
+					return
+				}
+				// Prepare the properties for caching
+				toCache = append(toCache, &cacheItem{key: lckeys[idx], value: data})
+				// Deserialize the properties into a struct
+				if exists {
+					err = deserializeProperties(dsdst[lo+i], propLists[i])
+					if err != nil && (!IgnoreFieldMismatch || !errFieldMismatch(err)) {
+						multiErr[idx] = err
+					}
+				}
+			}
+			gmerr := datastore.GetMulti(g.Context, dskeys[lo:hi], propLists)
 			if gmerr != nil {
 				mu.Lock()
 				anyErr = true // this flag tells GetMulti to return multiErr later
@@ -551,128 +702,98 @@ func (g *Goon) GetMulti(dst interface{}) error {
 					return
 				}
 				for i, idx := range dixs[lo:hi] {
-					if merr[i] == nil || (IgnoreFieldMismatch && errFieldMismatch(merr[i])) {
-						toCache = append(toCache, dsdst[lo+i])
-						exists = append(exists, 1)
+					if merr[i] == nil {
+						handleProp(i, idx, true)
 					} else {
 						if merr[i] == datastore.ErrNoSuchEntity {
-							toCache = append(toCache, dsdst[lo+i])
-							exists = append(exists, 0)
+							handleProp(i, idx, false)
 						}
 						multiErr[idx] = merr[i]
 					}
 				}
 			} else {
-				toCache = append(toCache, dsdst[lo:hi]...)
-				exists = append(exists, bytes.Repeat([]byte{1}, hi-lo)...)
+				for i, idx := range dixs[lo:hi] {
+					handleProp(i, idx, true)
+				}
 			}
 			if len(toCache) > 0 {
-				if err := g.putMemcache(toCache, exists); err != nil {
-					g.error(err)
-					// since putMemcache() gives no guarantee it will actually store the data in memcache
-					// we log and swallow this error
+				// Populate memcache in a goroutine because there's network involved
+				// and we can be doing useful work while waiting for I/O
+				errc := make(chan error)
+				go func() {
+					errc <- g.putMemcache(toCache)
+				}()
+				// Populate local cache
+				g.cache.SetMulti(toCache)
+				// Wait for memcache population to finish
+				err := <-errc
+				// .. but only propagate the memcache error if configured to do so
+				if propagateMemcachePutError && err != nil {
+					mu.Lock()
+					extraErr = err
+					mu.Unlock()
 				}
-
 			}
 		}(i)
 	}
 	wg.Wait()
 	if anyErr {
 		return realError(multiErr)
+	} else if extraErr != nil {
+		return extraErr
 	}
 	return nil
 }
 
-// Delete deletes the entity for the given key.
-func (g *Goon) Delete(key *datastore.Key) error {
-	keys := []*datastore.Key{key}
-	err := g.DeleteMulti(keys)
-	if me, ok := err.(appengine.MultiError); ok {
-		return me[0]
+// Delete deletes the provided entity.
+// Takes either *S or *datastore.Key.
+func (g *Goon) Delete(src interface{}) error {
+	var srcs interface{}
+	if key, ok := src.(*datastore.Key); ok {
+		srcs = []*datastore.Key{key}
+	} else {
+		v := reflect.ValueOf(src)
+		if v.Kind() != reflect.Ptr {
+			return fmt.Errorf("goon: expected pointer to a struct, got %#v", src)
+		}
+		srcs = []interface{}{src}
+	}
+	err := g.DeleteMulti(srcs)
+	if err != nil {
+		// Look for an embedded error if it's multi
+		if me, ok := err.(appengine.MultiError); ok {
+			return me[0]
+		}
 	}
 	return err
 }
 
-const deleteMultiLimit = 500
-
-// Returns a single error if each error in MultiError is the same
-// otherwise, returns multiError or nil (if multiError is empty)
-func realError(multiError appengine.MultiError) error {
-	if len(multiError) == 0 {
-		return nil
-	}
-	init := multiError[0]
-	for i := 1; i < len(multiError); i++ {
-		// since type error could hold structs, pointers, etc,
-		// the only way to compare non-nil errors is by their string output
-		if init == nil || multiError[i] == nil {
-			if init != multiError[i] {
-				return multiError
-			}
-		} else if init.Error() != multiError[i].Error() {
-			return multiError
+// DeleteMulti is a batch version of Delete.
+// Takes either []*S or []*datastore.Key.
+func (g *Goon) DeleteMulti(src interface{}) error {
+	keys, ok := src.([]*datastore.Key)
+	if !ok {
+		var err error
+		keys, err = g.extractKeys(src, false) // don't allow incomplete keys on a Delete request
+		if err != nil {
+			return err
 		}
 	}
-	// all errors are the same
-	// some errors are *always* returned in MultiError form from the datastore
-	if _, ok := init.(*datastore.ErrFieldMismatch); ok { // returned in GetMulti
-		return multiError
-	}
-	if init == datastore.ErrInvalidEntityType || // returned in GetMulti
-		init == datastore.ErrNoSuchEntity { // returned in GetMulti
-		return multiError
-	}
-	// datastore.ErrInvalidKey is returned as a single error in PutMulti
-	return init
-}
-
-// DeleteMulti is a batch version of Delete.
-func (g *Goon) DeleteMulti(keys []*datastore.Key) error {
 	if len(keys) == 0 {
 		return nil
 		// not an error, and it was "successful", so return nil
 	}
-	memkeys := make([]string, len(keys))
-
-	g.cacheLock.Lock()
-	for i, k := range keys {
-		mk := MemcacheKey(k)
-		memkeys[i] = mk
-
-		if g.inTransaction {
-			g.txnCacheLock.Lock()
-			delete(g.toSet, mk)
-			g.toDelete[mk] = true
-			g.txnCacheLock.Unlock()
-		} else {
-			delete(g.cache, mk)
-		}
-	}
-	g.cacheLock.Unlock()
-
-	// Memcache needs to be updated after the datastore to prevent a common race condition,
-	// where a concurrent request will fetch the not-yet-updated data from the datastore
-	// and populate memcache with it.
-	if g.inTransaction {
-		g.txnCacheLock.Lock()
-		for _, mk := range memkeys {
-			g.toDeleteMC[mk] = true
-		}
-		g.txnCacheLock.Unlock()
-	} else {
-		defer memcache.DeleteMulti(g.Context, memkeys)
-	}
 
 	mu := new(sync.Mutex)
 	multiErr, any := make(appengine.MultiError, len(keys)), false
-	goroutines := (len(keys)-1)/deleteMultiLimit + 1
+	goroutines := (len(keys)-1)/datastoreDeleteMultiMaxItems + 1
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func(i int) {
 			defer wg.Done()
-			lo := i * deleteMultiLimit
-			hi := (i + 1) * deleteMultiLimit
+			lo := i * datastoreDeleteMultiMaxItems
+			hi := (i + 1) * datastoreDeleteMultiMaxItems
 			if hi > len(keys) {
 				hi = len(keys)
 			}
@@ -694,6 +815,26 @@ func (g *Goon) DeleteMulti(keys []*datastore.Key) error {
 		}(i)
 	}
 	wg.Wait()
+
+	// Caches need to be updated after the datastore to prevent a common race condition,
+	// where a concurrent request will fetch the not-yet-updated data from the datastore
+	// and populate the caches with it.
+	cachekeys := make([]string, 0, len(keys))
+	for _, key := range keys {
+		cachekeys = append(cachekeys, cacheKey(key))
+	}
+	if g.inTransaction {
+		g.txnCacheLock.Lock()
+		for _, ck := range cachekeys {
+			g.toDelete[ck] = struct{}{}
+			g.toDeleteMC[ck] = struct{}{}
+		}
+		g.txnCacheLock.Unlock()
+	} else {
+		g.cache.DeleteMulti(cachekeys)
+		g.memcacheDeleteError(memcache.DeleteMulti(g.Context, cachekeys))
+	}
+
 	if any {
 		return realError(multiErr)
 	}
@@ -712,4 +853,35 @@ func NotFound(err error, idx int) bool {
 func errFieldMismatch(err error) bool {
 	_, ok := err.(*datastore.ErrFieldMismatch)
 	return ok
+}
+
+// Returns a single error if each error in MultiError is the same
+// otherwise, returns multiError or nil (if multiError is empty)
+func realError(multiError appengine.MultiError) error {
+	if len(multiError) == 0 {
+		return nil
+	}
+	init := multiError[0]
+	// some errors are *always* returned in MultiError form from the datastore
+	if _, ok := init.(*datastore.ErrFieldMismatch); ok { // returned in GetMulti
+		return multiError
+	}
+	if init == datastore.ErrInvalidEntityType || // returned in GetMulti
+		init == datastore.ErrNoSuchEntity { // returned in GetMulti
+		return multiError
+	}
+	// check if all errors are the same
+	for i := 1; i < len(multiError); i++ {
+		// since type error could hold structs, pointers, etc,
+		// the only way to compare non-nil errors is by their string output
+		if init == nil || multiError[i] == nil {
+			if init != multiError[i] {
+				return multiError
+			}
+		} else if init.Error() != multiError[i].Error() {
+			return multiError
+		}
+	}
+	// datastore.ErrInvalidKey is returned as a single error in PutMulti
+	return init
 }
